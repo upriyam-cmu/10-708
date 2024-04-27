@@ -66,11 +66,6 @@ def num_to_groups(num, divisor):
         arr.append(remainder)
     return arr
 
-def convert_image_to_fn(img_type, image):
-    if image.mode != img_type:
-        return image.convert(img_type)
-    return image
-
 # normalization functions
 
 def normalize_to_neg_one_to_one(img):
@@ -128,8 +123,8 @@ class GaussianDiffusion(nn.Module):
         image_size,
         timesteps = 1000,
         sampling_timesteps = None,
-        objective = 'pred_v',
-        beta_schedule = 'sigmoid',
+        objective = 'pred_noise',
+        beta_schedule = 'cosine',
         schedule_fn_kwargs = dict(),
         ddim_sampling_eta = 0.,
         auto_normalize = True,
@@ -144,7 +139,7 @@ class GaussianDiffusion(nn.Module):
         self.model = model
 
         self.channels = self.model.channels
-        self.self_condition = self.model.self_condition
+        self.self_condition = None
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -243,6 +238,8 @@ class GaussianDiffusion(nn.Module):
         return self.betas.device
 
     def predict_start_from_noise(self, x_t, t, noise):
+        if isinstance(noise, torch.Tensor):
+            noise[:,1:,:,:] = 0
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
@@ -275,8 +272,8 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, clip_x_start = False, rederive_pred_noise = False):
+        model_output = self.model(x, t)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -316,6 +313,8 @@ class GaussianDiffusion(nn.Module):
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
+        if isinstance(noise, torch.Tensor):
+            noise[:, 1:, :, :] = 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
@@ -339,22 +338,19 @@ class GaussianDiffusion(nn.Module):
         return ret
 
     @torch.inference_mode()
-    def ddim_sample(self, shape, return_all_timesteps = False):
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+    def ddim_sample(self, x_start, return_all_timesteps = False):
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = x_start.shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
-        img = torch.randn(shape, device = device)
+        img = x_start
         imgs = [img]
-
-        x_start = None
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
-            self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start = True, rederive_pred_noise = True)
 
             if time_next < 0:
                 img = x_start
@@ -368,6 +364,7 @@ class GaussianDiffusion(nn.Module):
             c = (1 - alpha_next - sigma ** 2).sqrt()
 
             noise = torch.randn_like(img)
+            noise[:,1:,:,:] = 0
 
             img = x_start * alpha_next.sqrt() + \
                   c * pred_noise + \
@@ -408,7 +405,9 @@ class GaussianDiffusion(nn.Module):
 
     @autocast(enabled = False)
     def q_sample(self, x_start, t, noise = None):
+        b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
+        noise[:,1:,:,:] = 0
 
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
@@ -436,18 +435,12 @@ class GaussianDiffusion(nn.Module):
         # and condition with unet with that
         # this technique will slow down training by 25%, but seems to lower FID significantly
 
-        x_self_cond = None
-        if self.self_condition and random() < 0.5:
-            with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t).pred_x_start
-                x_self_cond.detach_()
-
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        model_out = self.model(x, t)
 
         if self.objective == 'pred_noise':
-            target = noise
+            target = noise[:, 0, :, :]
         elif self.objective == 'pred_x0':
             target = x_start
         elif self.objective == 'pred_v':
@@ -478,7 +471,6 @@ class Trainer(object):
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
-        augment_horizontal_flip = True,
         train_lr = 1e-4,
         train_num_steps = 100000,
         ema_update_every = 10,
@@ -492,11 +484,8 @@ class Trainer(object):
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        convert_image_to = None,
-        calculate_fid = True,
         inception_block_idx = 2048,
         max_grad_norm = 1.,
-        num_fid_samples = 50000,
         save_best_and_latest_only = False
     ):
         super().__init__()
@@ -513,11 +502,6 @@ class Trainer(object):
         self.model = diffusion_model
         self.channels = diffusion_model.channels
         is_ddim_sampling = diffusion_model.is_ddim_sampling
-
-        # default convert_image_to depending on channels
-
-        if not exists(convert_image_to):
-            convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
 
         # sampling and training hyperparameters
 
